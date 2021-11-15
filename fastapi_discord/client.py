@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
 import aiohttp
@@ -37,30 +38,38 @@ class TokenResponse(TypedDict):
 PAYLOAD = Union[TokenGrantPayload, RefreshTokenPayload]
 
 
-def _tokens(resp: TokenResponse) -> Tuple[str, str]:
-    """
-    Extracts tokens from TokenResponse
+@dataclass
+class Tokens:
+    access_token: str
+    refresh_token: str
 
-    Parameters
-    ----------
-    resp: TokenResponse
-        Response
+    @classmethod
+    def from_token_response(cls, resp: TokenResponse):
+        """Extracts tokens from TokenResponse
 
-    Returns
-    -------
-    Tuple[str, str]
-        An union of access_token and refresh_token
+        Parameters
+        ----------
+        resp: TokenResponse
+            Response
 
-    Raises
-    ------
-    InvalidToken
-        If tokens are `None`
+        Returns
+        -------
+        Tokens
+            The access and refresh tokens
 
-    """
-    access_token, refresh_token = resp.get("access_token"), resp.get("refresh_token")
-    if access_token is None or refresh_token is None:
-        raise InvalidToken("Tokens can't be None")
-    return access_token, refresh_token
+        Raises
+        ------
+        InvalidToken
+            If tokens are `None`
+
+        """
+
+        access_token, refresh_token = resp.get("access_token"), resp.get(
+            "refresh_token"
+        )
+        if access_token is None or refresh_token is None:
+            raise InvalidToken("Tokens can't be None")
+        return cls(access_token, refresh_token)
 
 
 class DiscordOAuthClient:
@@ -99,20 +108,36 @@ class DiscordOAuthClient:
     oauth_login_url = property(get_oauth_login_url)
 
     @cached(ttl=550)
-    async def request(self, route: str, token: str = None, method: Literal["GET", "POST"] = "GET"):
+    async def request(
+        self,
+        route: str,
+        token: Tokens = None,
+        method: Literal["GET", "POST"] = "GET",
+        try_refresh=True,
+    ):
         headers: Dict = {}
         if token:
-            headers = {"Authorization": f"Bearer {token}"}
+            headers = {"Authorization": f"Bearer {token.access_token}"}
         if method == "GET":
-            async with self.client_session.get(f"{DISCORD_API_URL}{route}", headers=headers) as resp:
+            async with self.client_session.get(
+                f"{DISCORD_API_URL}{route}", headers=headers
+            ) as resp:
                 data = await resp.json()
         elif method == "POST":
-            async with self.client_session.post(f"{DISCORD_API_URL}{route}", headers=headers) as resp:
+            async with self.client_session.post(
+                f"{DISCORD_API_URL}{route}", headers=headers
+            ) as resp:
                 data = await resp.json()
         else:
             raise Exception("Other HTTP than GET and POST are currently not Supported")
         if resp.status == 401:
-            raise Unauthorized
+            if try_refresh:
+                token = await self.refresh_access_token(token.refresh_token)
+                return await self.request(
+                    route, token=token, method=method, try_refresh=False
+                )
+            else:
+                raise Unauthorized
         if resp.status == 429:
             raise RateLimited(data, resp.headers)
         return data
@@ -121,7 +146,7 @@ class DiscordOAuthClient:
         async with self.client_session.post(DISCORD_TOKEN_URL, data=payload) as resp:
             return await resp.json()
 
-    async def get_access_token(self, code: str) -> Tuple[str, str]:
+    async def get_access_token(self, code: str) -> Tokens:
         payload: TokenGrantPayload = {
             "client_id": self.client_id,
             "client_secret": self.client_secret,
@@ -130,9 +155,9 @@ class DiscordOAuthClient:
             "redirect_uri": self.redirect_uri,
         }
         resp = await self.get_token_response(payload)
-        return _tokens(resp)
+        return Tokens.from_token_response(resp)
 
-    async def refresh_access_token(self, refresh_token: str) -> Tuple[str, str]:
+    async def refresh_access_token(self, refresh_token: str) -> Tokens:
         payload: RefreshTokenPayload = {
             "client_id": self.client_id,
             "client_secret": self.client_secret,
@@ -140,43 +165,24 @@ class DiscordOAuthClient:
             "refresh_token": refresh_token,
         }
         resp = await self.get_token_response(payload)
-        return _tokens(resp)
+        return Tokens.from_token_response(resp)
 
-    async def user(self, request: Request):
+    async def user(self, token: Tokens) -> User:
         if "identify" not in self.scopes:
             raise ScopeMissing("identify")
         route = "/users/@me"
-        token = self.get_token(request)
         return User(**(await self.request(route, token)))
 
-    async def guilds(self, request: Request) -> List[GuildPreview]:
+    async def guilds(self, token: Tokens) -> List[GuildPreview]:
         if "guilds" not in self.scopes:
             raise ScopeMissing("guilds")
         route = "/users/@me/guilds"
-        token = self.get_token(request)
         return [Guild(**guild) for guild in await self.request(route, token)]
 
-    def get_token(self, request: Request):
-        authorization_header = request.headers.get("Authorization")
-        if not authorization_header:
-            raise Unauthorized
-        authorization_header = authorization_header.split(" ")
-        if not authorization_header[0] == "Bearer" or len(authorization_header) > 2:
-            raise Unauthorized
-
-        token = authorization_header[1]
-        return token
-
-    async def isAuthenticated(self, token: str):
+    async def isAuthenticated(self, token: Tokens) -> bool:
         route = "/oauth2/@me"
         try:
             await self.request(route, token)
             return True
         except Unauthorized:
             return False
-
-    async def requires_authorization(self, bearer: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer())):
-        if bearer is None:
-            raise Unauthorized
-        if not await self.isAuthenticated(bearer.credentials):
-            raise Unauthorized
